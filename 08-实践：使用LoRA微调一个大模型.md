@@ -1,5 +1,9 @@
 ## LoRA 微调实践：基于Qwen-7B的LoRA微调
 
+[实战｜基于LoRA的开源大模型微调全流程：从环境搭建到效果验证 - AI设计栈 - 博客园](https://www.cnblogs.com/aitoolhub/p/19473148)
+
+> 做不出来，没有足够的显卡
+
 LoRA（Low-Rank Adaptation，低秩自适应）是目前大模型微调领域最主流、最实用的技术之一。简单来说，它的核心目标是**用极低的成本（显存和时间），让一个通用的大模型快速学会某个特定领域的知识或技能**。
 
 如果把大模型比作一个拥有千亿参数的“学霸”，全量微调（Fine-tuning）相当于把这个学霸拉回学校，把他脑子里所有的知识重新学一遍，这不仅耗时，而且需要极其昂贵的算力（显存）。
@@ -83,8 +87,89 @@ print(f"LoRA配置类加载成功: {LoraConfig.__name__}")
 
 若输出`“CUDA可用: True”`和`“LoRA配置类加载成功: LoraConfig”`，则环境搭建完成。
 
+### 二、数据加载
+
+使用**Magpie-Qwen2**数据集，Magpie-Qwen2 是一个专门为指令微调设计的高质量合成数据集，它的核心亮点在于“由强大的 72B 模型生成并经过严格过滤”，这保证了数据的纯净度和逻辑深度。使用该数据集可以做到：
+
+- **提升模型的“智商”与逻辑性**：由于是由 72B 级别的大模型生成的，数据中蕴含了非常严密的思维链（CoT）和推理过程。用它微调小模型（如 Qwen2-7B 或 Llama3-8B），可以显著提升小模型在复杂问答、逻辑推理和事实性回复上的表现。
+- **低成本复刻大模型能力**：对于无法直接使用 72B 超大模型的团队，通过 Magpie-Qwen2 进行指令微调，可以让你的 7B 或 14B 模型在对话能力上大幅逼近超大模型的水准。
+
+加载方式和其他 Hugging Face 数据集完全一致。可以直接通过以下代码加载它的不同版本：
+
+```python
+from datasets import load_dataset
+
+# 加载 Magpie-Qwen2 的 200K 高质量版本
+dataset_200k = load_dataset(
+    "Magpie-Align/Magpie-Qwen2-Pro-200K-Chinese", 
+    cache_dir="./model/huggingface_cache",
+    split="train")
+
+# 或者加载 1M 的大规模版本（如果存在）
+# dataset_1m = load_dataset("Magpie-Align/Magpie-Qwen2-Pro-1M", split="train")
+
+# 查看第一条数据的结构
+print(dataset_200k[0])
+```
+
+> 待定
+
+### 三、模型加载 & LoRA配置
+
+加载Qwen-7B模型（采用INT4量化版本，降低显存占用），并配置LoRA参数。
+
+#### 1. 加载量化模型
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
-### 二、数据准备
+# 模型路径
+local_cache_path = "./model/qwen-7b" 
+# 量化配置：采用4-bit量化，降低显存占用
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
 
-使用**Magpie-Qwen2**数据集，
+# 加载Qwen-7B模型和Tokenizer（需提前在Hugging Face注册并同意协议）
+model_name = "Qwen/Qwen-7B-Chat"
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name, 
+    cache_dir=local_cache_path,
+    trust_remote_code=True)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    cache_dir=local_cache_path,
+    quantization_config=bnb_config,
+    device_map="auto",  # 自动分配设备（GPU/CPU）
+    trust_remote_code=True
+)
+model.config.use_cache = False  # 禁用缓存，避免训练时出错
+model.config.pretraining_tp = 1
+```
+
+#### 2. 配置LoRA参数
+
+```python
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(
+    r=8,  # LoRA秩，越小显存占用越少，推荐8-32
+    lora_alpha=32,  # 缩放系数，通常为r的2-4倍
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Qwen模型的Attention层关键模块
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"  # 因果语言建模（生成任务）
+)
+
+# 将LoRA配置注入模型
+model = get_peft_model(model, lora_config)
+# 查看模型参数总量和可训练参数量
+model.print_trainable_parameters()
+```
+
+输出示例：`trainable params: 1,179,648 || all params: 7,249,483,776 || trainable%: 0.0163`，可见仅训练0.016%的参数，显存压力极大降低。
